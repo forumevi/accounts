@@ -5,9 +5,15 @@
  * verification.
  * @module
  */
+import { exportJWK, generateKeyPair, SignJWT } from 'jose'
+import { Address, Secp256k1 } from 'ox'
 import { SignatureErc6492 } from 'ox/erc6492'
 import { SignatureErc8010 } from 'ox/erc8010'
-import { SignatureEnvelope, SignaturePreAuthorized } from 'ox/tempo'
+import {
+  KeyAuthorization,
+  SignatureEnvelope,
+  SignaturePreAuthorized,
+} from 'ox/tempo'
 import {
   concat,
   custom,
@@ -21,6 +27,7 @@ import { parseSiweMessage } from 'viem/siwe'
 import { Account } from 'viem/tempo'
 import { describe, expect, test } from 'vite-plus/test'
 import * as Accounts from '../Accounts.js'
+import * as Dpop from '../internal/Dpop.js'
 import * as Session from '../Session.js'
 import * as Store from '../Store.js'
 import { backend } from './backend.js'
@@ -28,6 +35,9 @@ import { siwe } from './siwe.js'
 import { viem } from './viem.js'
 
 const origin = 'https://app.example.com'
+
+/** Where Tempo ID runs, which issues the access tokens of a sign-in with an access key. */
+const tempoId = 'https://id.test'
 
 /** The precompile that holds each account's config commitment. */
 const accountConfiguration = '0xaacc000000000000000000000000000000000000'
@@ -786,6 +796,100 @@ describe('siwe.complete', () => {
         "error": "ContractFunctionExecutionError",
         "stored": undefined,
       }
+    `)
+  })
+
+  test("verifies the DPoP proof of an access key's sign-in for the public URL of `accessTokens.url` behind a proxy that terminates TLS", async () => {
+    const { privateKey: issuerKey, publicKey } = await generateKeyPair('RS256')
+    const jwk = { ...(await exportJWK(publicKey)), alg: 'RS256', kid: 'test' }
+    const fetch = (() =>
+      Promise.resolve(
+        Response.json({ keys: [jwk] }),
+      )) as unknown as typeof globalThis.fetch
+    const create = (accessTokens?: siwe.Options['accessTokens']) =>
+      Accounts.create({
+        chain: 4217,
+        clientId: origin,
+        fetch,
+        plugins: [
+          backend({ store: Store.memory() }),
+          siwe(accessTokens ? { accessTokens } : {}),
+          viem({ transport: node().transport }),
+        ],
+        url: tempoId,
+      })
+    // The page signs its proof for the public URL, and the proxy passes the internal URL on.
+    const attempt = async (accounts: ReturnType<typeof create>) => {
+      const { id, message } = await start(accounts)
+      const owner = Secp256k1.randomPrivateKey()
+      const address = Address.fromPublicKey(
+        Secp256k1.getPublicKey({ privateKey: owner }),
+      )
+      const accessKey = Address.fromPublicKey(
+        Secp256k1.getPublicKey({ privateKey: Secp256k1.randomPrivateKey() }),
+      )
+      const authorization = KeyAuthorization.from({
+        address: accessKey,
+        chainId: 4217n,
+        type: 'secp256k1',
+        witness: hashMessage(message),
+      })
+      const keyAuthorization = KeyAuthorization.toRpc(
+        KeyAuthorization.from(authorization, {
+          signature: Secp256k1.sign({
+            payload: KeyAuthorization.getSignPayload(authorization),
+            privateKey: owner,
+          }),
+        }),
+      )
+      const dpop = await Dpop.create()
+      const token = await new SignJWT({
+        access_keys: [{ account: address, address: accessKey, chain_id: 4217 }],
+        client_id: origin,
+        cnf: { jkt: Dpop.thumbprint(dpop) },
+      })
+        .setProtectedHeader({ alg: 'RS256', kid: 'test', typ: 'at+jwt' })
+        .setAudience(tempoId)
+        .setExpirationTime('5m')
+        .setIssuedAt()
+        .setIssuer(tempoId)
+        .setSubject('user_1')
+        .sign(issuerKey)
+      const proof = await Dpop.proof(dpop, {
+        accessToken: token,
+        method: 'POST',
+        url: `${origin}/api/siwe?step=verify`,
+      })
+      return accounts.siwe
+        .complete({
+          address,
+          id,
+          keyAuthorization,
+          message,
+          request: new Request('http://10.0.0.1:3000/api/siwe?step=verify', {
+            headers: { authorization: `DPoP ${token}`, dpop: proof },
+            method: 'POST',
+          }),
+        })
+        .then(reason, reason)
+    }
+
+    const results = await Promise.all([
+      attempt(create()),
+      attempt(create({ url: origin })),
+      attempt(
+        create({
+          url: (request) => request.url.replace('http://10.0.0.1:3000', origin),
+        }),
+      ),
+    ])
+
+    expect(results).toMatchInlineSnapshot(`
+      [
+        "signer",
+        "verified",
+        "verified",
+      ]
     `)
   })
 

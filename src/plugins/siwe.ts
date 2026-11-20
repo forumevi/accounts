@@ -625,12 +625,14 @@ function server(options: siwe.Options) {
               import('../AccessToken.js'),
               import('../Challenge.js'),
             ])
+            const { url, ...verifierOptions } = options.accessTokens ?? {}
             accessTokens ??= AccessToken.create(
               instance.config,
-              options.accessTokens,
+              verifierOptions,
             )
             const token = await AccessToken.verifyRequest(accessTokens, {
               request,
+              url,
             })
             if (!token) return false
             const proved = await Challenge.verify(getClient(chainId), {
@@ -749,7 +751,17 @@ export declare namespace siwe {
      * several apps, or `issuer` for a `url` that reaches Tempo ID at an internal address. Defaults
      * to the instance's client ID and URL.
      */
-    accessTokens?: AccessTokenModule.create.Options | undefined
+    accessTokens?:
+      | (AccessTokenModule.create.Options & {
+          /**
+           * The public URL of the verify route's request, which the access token's DPoP proof
+           * names: a function of the request that returns it, or the public origin, such as
+           * `https://app.example`, to which the path and query of `request.url` apply. Set it
+           * behind a proxy that terminates TLS. Defaults to `request.url`.
+           */
+          url?: string | ((request: Request) => string) | undefined
+        })
+      | undefined
     /**
      * The IDs of the chains that a sign-in's message may name, such as the chains that the app's
      * payments use. The `viem` plugin resolves each. Defaults to the instance's chain.
