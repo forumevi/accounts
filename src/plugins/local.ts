@@ -149,7 +149,24 @@ export function local(options: local.Options = {}) {
       const fallback = Lock.create()
       function exclusive<result>(fn: () => Promise<result>): Promise<result> {
         const { lock } = store()
-        return lock ? lock(key, fn) : fallback(key, fn)
+        if (lock) return lock(key, fn)
+        // A store without `lock`, such as IndexedDB, the default store of a browser, is shared by
+        // the page's other instances and by other tabs, so Web Locks order their calls too. A page
+        // that refuses the lock, such as one without site storage, orders only its own calls.
+        const locks = (
+          globalThis.navigator as { locks?: LockManager } | undefined
+        )?.locks
+        if (!locks) return fallback(key, fn)
+        let started = false
+        return locks
+          .request(`${key}:exclusive`, () => {
+            started = true
+            return fn()
+          })
+          .catch((error: unknown) => {
+            if (started) throw error
+            return fallback(key, fn)
+          })
       }
 
       function store(): Store {

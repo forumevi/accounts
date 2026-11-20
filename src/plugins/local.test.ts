@@ -535,6 +535,33 @@ describe('local across instances', () => {
     expect(await second.session.get()).toMatchObject({ address, kind: 'local' })
   })
 
+  test('creates one owner key for concurrent calls of two instances on a store without a lock, such as IndexedDB', async () => {
+    // The default store of a browser, IndexedDB, has no `lock`, and each instance and tab of the
+    // origin reads and writes it.
+    const store = Store.from({ ...Store.memory(), lock: undefined })
+    const first = instance({ store }).accounts
+    const second = instance({ store }).accounts
+
+    const results = await Promise.allSettled([
+      first.local.create(),
+      second.local.create(),
+      first.local.import({ privateKey: generatePrivateKey() }),
+    ])
+    const created = results.filter((result) => result.status === 'fulfilled')
+
+    expect(created).toHaveLength(1)
+    expect(
+      results.filter(
+        (result) =>
+          result.status === 'rejected' && result.reason instanceof ExistsError,
+      ),
+    ).toHaveLength(2)
+    expect((await second.local.get())!.address).toBe(
+      (created[0] as PromiseFulfilledResult<Session.LocalSession>).value
+        .address,
+    )
+  })
+
   test('keeps an access key that another instance added with a sooner expiry', async () => {
     const store = Store.memory()
     const options = {
